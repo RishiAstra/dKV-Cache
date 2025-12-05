@@ -120,8 +120,8 @@ class VectorizedDynamicCache(Cache):
         self.key_cache = []
         self.value_cache = []
 
-    def is_empty(self, layer_idx: int = 0) -> bool:
-        return len(self.key_cache) <= layer_idx
+    def is_empty(self) -> bool:
+        return len(self.key_cache) < self.num_hidden_layers or len(self.value_cache) < self.num_hidden_layers
 
     def __getitem__(self, layer_idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         if layer_idx < len(self.key_cache):
@@ -140,6 +140,17 @@ class VectorizedDynamicCache(Cache):
         if layer_idx < len(self.key_cache):
             return self.key_cache[layer_idx].shape[-2]
         return 0
+    
+    def get_seq_length(self, layer_idx: Optional[int] = 0) -> int:
+        """Returns the sequence length of the cached states. A layer index can be optionally passed."""
+        # TODO: deprecate this function in favor of `cache_position`
+        is_empty_layer = (
+            len(self.key_cache) == 0  # no cache in any layer
+            or len(self.key_cache) <= layer_idx  # skipped `layer_idx` and hasn't run a layer with cache after it
+            or not self.key_cache[layer_idx].numel()  # the layer has no cache
+        )
+        layer_seq_length = self.key_cache[layer_idx].shape[-2] if not is_empty_layer else 0
+        return layer_seq_length
 
 
 class HierarchicalDynamicCache(Cache):

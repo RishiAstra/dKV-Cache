@@ -571,7 +571,7 @@ class DreamGenerationMixin:
                     if prv_cache_position is None:
                         prv_cache_position = cache_position
                         cache_position = None  
-                elif generation_config.cache_type == "decoded":
+                elif generation_config.cache_type == "decoded" or generation_config.cache_type == "new":
                     prv_cache_position = cache_position
                     #print(generation_config.cache_type, generation_config.shift_type, generation_config.cache_steps)
                     if generation_config.shift_type == "un":
