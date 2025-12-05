@@ -32,6 +32,7 @@ from transformers.utils import (
 )
 
 from .cache_utils import PrefillCache, DynamicCache
+from .new_cache_utils import VectorizedDynamicCache
 
 logger = logging.get_logger(__name__)
 
@@ -400,7 +401,9 @@ class DreamGenerationMixin:
         #print("x shape:", x.shape, generation_config.max_length, generation_config.max_new_tokens)
 
         # Setting the cache position for prefill. Would need to be changed if use dynamic cache for decoding.
+        # print("Use Cache:", generation_config.use_cache, generation_config.cache_type, "\n\n\n\n\n\n\n\n")
         if generation_config.use_cache:
+            # raise NotImplementedError(f"type: {generation_config.cache_type}")
             if generation_config.cache_type == "prefill":
                 past_key_values = PrefillCache(self.config.num_hidden_layers)
 
@@ -410,6 +413,13 @@ class DreamGenerationMixin:
                 prv_cache_position = None
             elif generation_config.cache_type == 'decoded':
                 past_key_values = DynamicCache(self.config.num_hidden_layers)
+                cache_position = ~(x == mask_token_id)
+                cache_position = torch.cat([cache_position[:, 1:], cache_position[:, -1:]], dim=-1)
+                prv_cache_position = None
+            elif generation_config.cache_type == 'new':
+                print("Using VectorizedDynamicCache\n\n\n\n\n\n\n\n")
+                # raise NotImplementedError(f"yay")
+                past_key_values = VectorizedDynamicCache(self.config.num_hidden_layers)
                 cache_position = ~(x == mask_token_id)
                 cache_position = torch.cat([cache_position[:, 1:], cache_position[:, -1:]], dim=-1)
                 prv_cache_position = None
@@ -454,7 +464,7 @@ class DreamGenerationMixin:
             else:
                 if generation_config.cache_type == "prefill":
                     pass
-                elif generation_config.cache_type == "decoded":
+                elif generation_config.cache_type == "decoded" or generation_config.cache_type == "new":
                     if i % generation_config.cache_steps == 0:
                         prv_cache_position = None
                         past_key_values.refresh_cache()
