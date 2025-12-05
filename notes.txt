@@ -1,3 +1,20 @@
+/home/raa32/miniconda3/envs/dkvcache/bin/python -m cProfile -o profile_dream_new2.out   dream_generate.py --new-cache --cache-steps 4 --steps 128 --seq-len 128
+
+
+
+/home/raa32/miniconda3/envs/dkvcache/bin/python -m cProfile -o profile.out \
+  llada_generate.py --decode --cache-steps 4 --steps 1024 --seq-len 1024
+
+
+
+/home/raa32/miniconda3/envs/dkvcache/bin/python -m cProfile -o profile.out \
+  llada_generate.py --decode --cache-steps 32 --steps 128 --seq-len 128
+
+
+nsys profile --trace=cuda,nvtx,osrt --output=nsys_llada_decode_cs32 /home/raa32/miniconda3/envs/dkvcache/bin/python llada_generate.py --decode --cache-steps 32 --steps 128 --seq-len 128
+
+
+
 nsys profile \
 --trace=cuda,nvtx,osrt \
 --output=nsys_dream_decode_cs32 \

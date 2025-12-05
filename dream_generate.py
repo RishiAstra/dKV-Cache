@@ -24,13 +24,14 @@ if __name__ == "__main__":
     parser.add_argument("--prefill", action="store_true", help="use dkv-cache-prefill")
     parser.add_argument("--decode", action="store_true", help="use dkv-cache-decode")
     parser.add_argument("--pd", action="store_true", help="use dkv-cache-pd")
+    parser.add_argument("--new-cache", action="store_true", help="use dkv-cache-new")
 
     parser.add_argument("--cache-steps", type=int, default=0, help="number of steps to cache")
     args = parser.parse_args()
 
     model_path = "Dream-org/Dream-v0-Instruct-7B"
 
-    if args.decode or args.prefill:
+    if args.decode or args.prefill or args.new_cache:
         from models.modeling_dream import DreamModel
         model = DreamModel.from_pretrained(model_path, torch_dtype=torch.bfloat16, trust_remote_code=True)
     elif args.pd:
@@ -101,8 +102,8 @@ if __name__ == "__main__":
         top_p=0.95,
         alg=args.sampling_alg,
         alg_temp=0.,
-        use_cache=args.decode or args.prefill or args.pd,
-        cache_type="decoded" if args.decode else "prefill" if args.prefill else "pd",
+        use_cache=args.decode or args.prefill or args.pd or args.new_cache,
+        cache_type="decoded" if args.decode else "prefill" if args.prefill else "pd" if args.pd else "new",
         cache_steps=args.cache_steps,
         shift_type="un"
     )
