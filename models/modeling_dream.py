@@ -22,6 +22,7 @@
 import math
 from typing import List, Optional, Tuple, Union
 import os
+import nvtx
 import torch
 import torch.utils.checkpoint
 from torch import nn
@@ -736,41 +737,42 @@ class DreamBaseModel(DreamPreTrainedModel):
         all_self_attns = () if output_attentions else None
 
         for decoder_layer in self.layers:
-            if output_hidden_states:
-                all_hidden_states += (hidden_states,)
+            with nvtx.annotate("dream_layer", color="blue"):
+                if output_hidden_states:
+                    all_hidden_states += (hidden_states,)
 
-            if self.gradient_checkpointing and self.training:
-                layer_outputs = self._gradient_checkpointing_func(
-                    decoder_layer.__call__,
-                    hidden_states,
-                    attention_mask,
-                    position_ids,
-                    past_key_values,
-                    output_attentions,
-                    use_cache,
-                    cache_position,
-                    prv_cache_position,
-                    position_embeddings,
-                    k_position_embeddings
-                )
-            else:
-                layer_outputs = decoder_layer(
-                    hidden_states,
-                    attention_mask=attention_mask,
-                    position_ids=position_ids,
-                    past_key_value=past_key_values,
-                    output_attentions=output_attentions,
-                    use_cache=use_cache,
-                    cache_position=cache_position,
-                    prv_cache_position=prv_cache_position,
-                    position_embeddings=position_embeddings,
-                    k_position_embeddings=k_position_embeddings
-                )
+                if self.gradient_checkpointing and self.training:
+                    layer_outputs = self._gradient_checkpointing_func(
+                        decoder_layer.__call__,
+                        hidden_states,
+                        attention_mask,
+                        position_ids,
+                        past_key_values,
+                        output_attentions,
+                        use_cache,
+                        cache_position,
+                        prv_cache_position,
+                        position_embeddings,
+                        k_position_embeddings
+                    )
+                else:
+                    layer_outputs = decoder_layer(
+                        hidden_states,
+                        attention_mask=attention_mask,
+                        position_ids=position_ids,
+                        past_key_value=past_key_values,
+                        output_attentions=output_attentions,
+                        use_cache=use_cache,
+                        cache_position=cache_position,
+                        prv_cache_position=prv_cache_position,
+                        position_embeddings=position_embeddings,
+                        k_position_embeddings=k_position_embeddings
+                    )
 
-            hidden_states = layer_outputs[0]
+                hidden_states = layer_outputs[0]
 
-            if output_attentions:
-                all_self_attns += (layer_outputs[1],)
+                if output_attentions:
+                    all_self_attns += (layer_outputs[1],)
 
         hidden_states = self.norm(hidden_states)
 
