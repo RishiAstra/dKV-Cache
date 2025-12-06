@@ -103,6 +103,12 @@ class VectorizedDynamicCache(Cache):
             value_states = torch.gather(value_states, 2, transfer_order[:, None, :, None].expand_as(value_states))
 
             cache_start_pos = torch.sum(~cache_position, dim=-1)
+            if not (cache_start_pos == cache_start_pos[0]).all():
+                raise ValueError(
+                    f"Heterogeneous batches not supported. "
+                    f"All sequences must cache the same number of tokens. "
+                    f"Got cache_start_pos={cache_start_pos.tolist()}"
+                )
             
             # Store - FIX: Ensure we're updating existing cache entries
             if len(self.key_cache) <= layer_idx:
@@ -221,6 +227,10 @@ class HierarchicalDynamicCache(Cache):
         
         # 'confirmed_len' tells us where the stable prefix ends.
         confirmed_len = cache_kwargs.get("confirmed_len", 0)
+        
+        # Validate confirmed_len
+        if confirmed_len < 0 or confirmed_len > seq_len:
+            raise ValueError(f"confirmed_len must be in [0, {seq_len}], got {confirmed_len}")
 
         # 1. Initialization Phase (First Step)
         if prv_cache_position is None:
@@ -312,19 +322,30 @@ class HierarchicalDynamicCache(Cache):
         self.moving_key_cache = []
         self.moving_value_cache = []
 
-    def is_empty(self, layer_idx: int = 0) -> bool:
-        return len(self.stable_key_cache) <= layer_idx
+    def is_empty(self) -> bool:
+        return (
+            len(self.stable_key_cache) < self.num_hidden_layers or 
+            len(self.stable_value_cache) < self.num_hidden_layers or
+            len(self.moving_key_cache) < self.num_hidden_layers or
+            len(self.moving_value_cache) < self.num_hidden_layers
+        )
 
     def __getitem__(self, layer_idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         if layer_idx < len(self.stable_key_cache):
-            final_keys = torch.cat(
-                [self.stable_key_cache[layer_idx], self.moving_key_cache[layer_idx]], 
-                dim=2
-            )
-            final_values = torch.cat(
-                [self.stable_value_cache[layer_idx], self.moving_value_cache[layer_idx]], 
-                dim=2
-            )
+            # Check if moving cache exists and has content
+            if layer_idx < len(self.moving_key_cache) and self.moving_key_cache[layer_idx].numel() > 0:
+                final_keys = torch.cat(
+                    [self.stable_key_cache[layer_idx], self.moving_key_cache[layer_idx]], 
+                    dim=2
+                )
+                final_values = torch.cat(
+                    [self.stable_value_cache[layer_idx], self.moving_value_cache[layer_idx]], 
+                    dim=2
+                )
+            else:
+                # No moving cache or it's empty, just return stable
+                final_keys = self.stable_key_cache[layer_idx]
+                final_values = self.stable_value_cache[layer_idx]
             return final_keys, final_values
         else:
             raise KeyError(f"Cache only has {len(self.stable_key_cache)} layers, attempted to access layer with index {layer_idx}")
@@ -338,5 +359,7 @@ class HierarchicalDynamicCache(Cache):
     
     def get_seq_length(self, layer_idx: int = 0) -> int:
         if layer_idx < len(self.stable_key_cache):
-            return self.stable_key_cache[layer_idx].shape[-2] + self.moving_key_cache[layer_idx].shape[-2]
+            stable_len = self.stable_key_cache[layer_idx].shape[-2]
+            moving_len = self.moving_key_cache[layer_idx].shape[-2] if layer_idx < len(self.moving_key_cache) else 0
+            return stable_len + moving_len
         return 0
