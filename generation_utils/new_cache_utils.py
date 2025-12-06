@@ -236,15 +236,65 @@ class HierarchicalDynamicCache(Cache):
         if prv_cache_position is None:
             # Initial fill - store everything as stable for now
             assert len(self.stable_key_cache) <= layer_idx, "Cache should be empty during initialization"
+
+            # Split into stable and moving portions based on confirmed_len
+            stable_keys = key_states[:, :, :confirmed_len, :]
+            stable_values = value_states[:, :, :confirmed_len, :]
             
-            key_states_selected = key_states[cache_position[:, None, :, None].expand_as(key_states)].view(B, n_h, -1, h_d)
-            self.stable_key_cache.append(key_states_selected)
-            value_states_selected = value_states[cache_position[:, None, :, None].expand_as(value_states)].view(B, n_h, -1, h_d)
-            self.stable_value_cache.append(value_states_selected)
+            moving_keys = key_states[:, :, confirmed_len:, :]
+            moving_values = value_states[:, :, confirmed_len:, :]
             
-            # Initialize empty moving caches
-            self.moving_key_cache.append(torch.empty(B, n_h, 0, h_d, device=key_states.device, dtype=key_states.dtype))
-            self.moving_value_cache.append(torch.empty(B, n_h, 0, h_d, device=value_states.device, dtype=value_states.dtype))
+            # Select only cached tokens from each
+            if cache_position is not None:
+                # Check: confirmed_len shouldn't exceed number of cached tokens
+                num_cached = cache_position.sum(dim=1)
+                if (confirmed_len > num_cached).any():
+                    raise ValueError(
+                        f"confirmed_len ({confirmed_len}) exceeds number of cached tokens. "
+                        f"Cached counts per batch: {num_cached.tolist()}"
+                    )
+                
+                stable_mask = cache_position[:, :confirmed_len]
+                moving_mask = cache_position[:, confirmed_len:]
+                
+                if stable_mask.any():
+                    # Expand mask to match tensor dimensions and extract True positions
+                    expanded_mask = stable_mask[:, None, :, None].expand_as(stable_keys)
+                    stable_keys = stable_keys[expanded_mask].view(B, n_h, -1, h_d)
+                    
+                    expanded_mask = stable_mask[:, None, :, None].expand_as(stable_values)
+                    stable_values = stable_values[expanded_mask].view(B, n_h, -1, h_d)
+                else:
+                    stable_keys = torch.empty(B, n_h, 0, h_d, device=key_states.device, dtype=key_states.dtype)
+                    stable_values = torch.empty(B, n_h, 0, h_d, device=value_states.device, dtype=value_states.dtype)
+                    
+                if moving_mask.any():
+                    # Expand mask to match tensor dimensions and extract True positions
+                    expanded_mask = moving_mask[:, None, :, None].expand_as(moving_keys)
+                    moving_keys = moving_keys[expanded_mask].view(B, n_h, -1, h_d)
+                    
+                    expanded_mask = moving_mask[:, None, :, None].expand_as(moving_values)
+                    moving_values = moving_values[expanded_mask].view(B, n_h, -1, h_d)
+                else:
+                    moving_keys = torch.empty(B, n_h, 0, h_d, device=key_states.device, dtype=key_states.dtype)
+                    moving_values = torch.empty(B, n_h, 0, h_d, device=value_states.device, dtype=value_states.dtype)
+            else:
+                raise ValueError("cache_position is required for HierarchicalDynamicCache")
+
+            self.stable_key_cache.append(stable_keys)
+            self.stable_value_cache.append(stable_values)
+            self.moving_key_cache.append(moving_keys)
+            self.moving_value_cache.append(moving_values)
+            
+            # Return combined cache
+            if moving_keys.numel() > 0:
+                final_keys = torch.cat([stable_keys, moving_keys], dim=2)
+                final_values = torch.cat([stable_values, moving_values], dim=2)
+            else:
+                final_keys = stable_keys
+                final_values = stable_values
+            
+            return final_keys, final_values
 
         # 2. Hierarchical Reordering Phase
         else:
@@ -258,6 +308,10 @@ class HierarchicalDynamicCache(Cache):
             # Calculate transfer order only for moving window
             moving_cache_pos = cache_position[:, confirmed_len:]
             moving_prv_pos = prv_cache_position[:, confirmed_len:]
+            # don't need for stable portion because it's a prefix of fully cached tokens
+            # can verify:
+            assert (cache_position[:, :confirmed_len] == True).all(), "Stable portion of cache_position should be all True"
+            assert (prv_cache_position[:, :confirmed_len] == True).all(), "Stable portion of prv_cache_position should be all True, make sure confirmed_len does not include newly cached tokens"
             
             if moving_cache_pos.numel() > 0 and moving_prv_pos.numel() > 0:
                 local_transfer_order = self.get_transfer_cache(
@@ -277,44 +331,48 @@ class HierarchicalDynamicCache(Cache):
                 moving_keys_reordered = moving_keys
                 moving_values_reordered = moving_values
 
+            # Extract only the cached portion of moving window
+            cache_start_in_moving = torch.sum(~moving_cache_pos, dim=-1)
+            
+            # Validate homogeneous batching
+            if not (cache_start_in_moving == cache_start_in_moving[0]).all():
+                raise ValueError(
+                    f"Heterogeneous batches not supported. "
+                    f"All sequences must cache the same number of tokens in moving window. "
+                    f"Got cache_start_in_moving={cache_start_in_moving.tolist()}"
+                )
+            
             # Update storage
+            new_moving_keys = moving_keys_reordered[:, :, cache_start_in_moving[0]:, :]
+            new_moving_values = moving_values_reordered[:, :, cache_start_in_moving[0]:, :]
             if len(self.stable_key_cache) <= layer_idx:
+                # First reordering pass for this layer - append
                 self.stable_key_cache.append(stable_keys)
                 self.stable_value_cache.append(stable_values)
-                
-                # Extract only the cached portion of moving window
-                cache_start_in_moving = torch.sum(~moving_cache_pos, dim=-1)
-                if cache_start_in_moving[0] < moving_keys_reordered.shape[2]:
-                    self.moving_key_cache.append(moving_keys_reordered[:, :, cache_start_in_moving[0]:, :])
-                    self.moving_value_cache.append(moving_values_reordered[:, :, cache_start_in_moving[0]:, :])
-                else:
-                    self.moving_key_cache.append(torch.empty(B, n_h, 0, h_d, device=key_states.device, dtype=key_states.dtype))
-                    self.moving_value_cache.append(torch.empty(B, n_h, 0, h_d, device=value_states.device, dtype=value_states.dtype))
+                self.moving_key_cache.append(new_moving_keys)
+                self.moving_value_cache.append(new_moving_values)
             else:
                 # Update existing entries
                 self.stable_key_cache[layer_idx] = stable_keys
                 self.stable_value_cache[layer_idx] = stable_values
-                
-                # Extract only the cached portion
-                cache_start_in_moving = torch.sum(~moving_cache_pos, dim=-1)
-                if cache_start_in_moving[0] < moving_keys_reordered.shape[2]:
-                    self.moving_key_cache[layer_idx] = moving_keys_reordered[:, :, cache_start_in_moving[0]:, :]
-                    self.moving_value_cache[layer_idx] = moving_values_reordered[:, :, cache_start_in_moving[0]:, :]
-                else:
-                    self.moving_key_cache[layer_idx] = torch.empty(B, n_h, 0, h_d, device=key_states.device, dtype=key_states.dtype)
-                    self.moving_value_cache[layer_idx] = torch.empty(B, n_h, 0, h_d, device=value_states.device, dtype=value_states.dtype)
+                self.moving_key_cache[layer_idx] = new_moving_keys
+                self.moving_value_cache[layer_idx] = new_moving_values
 
-        # Return combined cache
-        final_keys = torch.cat(
-            [self.stable_key_cache[layer_idx], self.moving_key_cache[layer_idx]], 
-            dim=2
-        )
-        final_values = torch.cat(
-            [self.stable_value_cache[layer_idx], self.moving_value_cache[layer_idx]], 
-            dim=2
-        )
-        
-        return final_keys, final_values
+            # Return combined cache
+            if self.moving_key_cache[layer_idx].numel() > 0:
+                final_keys = torch.cat(
+                    [self.stable_key_cache[layer_idx], self.moving_key_cache[layer_idx]], 
+                    dim=2
+                )
+                final_values = torch.cat(
+                    [self.stable_value_cache[layer_idx], self.moving_value_cache[layer_idx]], 
+                    dim=2
+                )
+            else:
+                final_keys = self.stable_key_cache[layer_idx]
+                final_values = self.stable_value_cache[layer_idx]
+            
+            return final_keys, final_values
 
     def refresh_cache(self):
         self.stable_key_cache = []
