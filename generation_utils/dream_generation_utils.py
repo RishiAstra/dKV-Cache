@@ -32,7 +32,7 @@ from transformers.utils import (
 )
 
 from .cache_utils import PrefillCache, DynamicCache
-from .new_cache_utils import VectorizedDynamicCache
+from .new_cache_utils import VectorizedDynamicCache, HierarchicalDynamicCache
 
 logger = logging.get_logger(__name__)
 
@@ -423,6 +423,13 @@ class DreamGenerationMixin:
                 cache_position = ~(x == mask_token_id)
                 cache_position = torch.cat([cache_position[:, 1:], cache_position[:, -1:]], dim=-1)
                 prv_cache_position = None
+            elif generation_config.cache_type == 'new_hier':
+                print("Using VectorizedDynamicCache Hierarchical\n\n\n\n\n\n\n\n")
+                # raise NotImplementedError(f"yay")
+                past_key_values = HierarchicalDynamicCache(self.config.num_hidden_layers)
+                cache_position = ~(x == mask_token_id)
+                cache_position = torch.cat([cache_position[:, 1:], cache_position[:, -1:]], dim=-1)
+                prv_cache_position = None
             else:
                 raise NotImplementedError(f"Unknown cache type: {generation_config.cache_type}")
         else:
@@ -464,7 +471,7 @@ class DreamGenerationMixin:
             else:
                 if generation_config.cache_type == "prefill":
                     pass
-                elif generation_config.cache_type == "decoded" or generation_config.cache_type == "new":
+                elif generation_config.cache_type == "decoded" or generation_config.cache_type == "new" or generation_config.cache_type == "new_hier":
                     if i % generation_config.cache_steps == 0:
                         prv_cache_position = None
                         past_key_values.refresh_cache()
@@ -570,8 +577,8 @@ class DreamGenerationMixin:
                     #print("In prefill")
                     if prv_cache_position is None:
                         prv_cache_position = cache_position
-                        cache_position = None  
-                elif generation_config.cache_type == "decoded" or generation_config.cache_type == "new":
+                        cache_position = None
+                elif generation_config.cache_type == "decoded" or generation_config.cache_type == "new" or generation_config.cache_type == "new_hier":
                     prv_cache_position = cache_position
                     #print(generation_config.cache_type, generation_config.shift_type, generation_config.cache_steps)
                     if generation_config.shift_type == "un":
