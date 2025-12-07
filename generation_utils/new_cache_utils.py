@@ -211,6 +211,30 @@ class HierarchicalDynamicCache(Cache):
 
         self._transfer_order = transfer_order
         return transfer_order
+    
+    def get_confirmed_len_local(self, cache_position_local):
+        """Find the contiguous prefix of cached tokens"""
+        # Find first False in cache_position
+        first_false = (~cache_position_local).nonzero(as_tuple=True)[0]
+        
+        if first_false.numel() > 0:
+            # There's at least one False - confirmed_len is position of first False
+            return first_false[0].item()
+        else:
+            # All True - entire sequence is stable
+            return cache_position_local.shape[0]
+        
+    def get_confirmed_len(self, cache_position):
+        """Vectorized confirmed length calculation for batch"""
+        if cache_position is None:
+            return 0
+        # Find first False in each batch element
+        B = cache_position.shape[0]
+        confirmed_lens = []
+        for b in range(B):
+            confirmed_lens.append(self.get_confirmed_len_local(cache_position[b]))
+
+        return min(confirmed_lens)
 
     def update(
         self,
@@ -226,7 +250,13 @@ class HierarchicalDynamicCache(Cache):
         cache_position = cache_kwargs.get("cache_position", None)
         
         # 'confirmed_len' tells us where the stable prefix ends.
-        confirmed_len = cache_kwargs.get("confirmed_len", 0)
+        # confirmed_len = cache_kwargs.get("confirmed_len", 0)
+        # confirmed_len = self.get_confirmed_len(cache_position) # NOTE: repeated work, could be once per model instead of per layer
+        confirmed_len_current = self.get_confirmed_len(cache_position)
+        confirmed_len_previous = self.get_confirmed_len(prv_cache_position)
+        confirmed_len = min(confirmed_len_current, confirmed_len_previous)
+
+        # print(f"Layer {layer_idx} - confirmed_len: {confirmed_len}")
         
         # Validate confirmed_len
         if confirmed_len < 0 or confirmed_len > seq_len:
@@ -310,8 +340,7 @@ class HierarchicalDynamicCache(Cache):
             moving_prv_pos = prv_cache_position[:, confirmed_len:]
             # don't need for stable portion because it's a prefix of fully cached tokens
             # can verify:
-            assert (cache_position[:, :confirmed_len] == True).all(), "Stable portion of cache_position should be all True"
-            assert (prv_cache_position[:, :confirmed_len] == True).all(), "Stable portion of prv_cache_position should be all True, make sure confirmed_len does not include newly cached tokens"
+            assert (cache_position[:, :confirmed_len] == True).all(), f"Stable portion of cache_position should be all True but got {cache_position[:, :confirmed_len]}"
             
             if moving_cache_pos.numel() > 0 and moving_prv_pos.numel() > 0:
                 local_transfer_order = self.get_transfer_cache(
