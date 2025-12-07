@@ -181,35 +181,42 @@ class HierarchicalDynamicCache(Cache):
         """Calculate transfer order for moving window only"""
         if layer_idx > 0:
             if self._transfer_order is None:
-                return self._compute_transfer_order(cache_position, prv_cache_position)
+                return self._compute_transfer_order_for_moving(cache_position, prv_cache_position)
             
             order = self._transfer_order
             if layer_idx == self.num_hidden_layers - 1:
                 self._transfer_order = None
             return order
         
-        return self._compute_transfer_order(cache_position, prv_cache_position)
+        return self._compute_transfer_order_for_moving(cache_position, prv_cache_position)
 
-    def _compute_transfer_order(self, cache_position, prv_cache_position):
-        """Vectorized reordering computation"""
-        B = cache_position.shape[0]
-        device = cache_position.device
-
-        prev_indices = prv_cache_position.nonzero(as_tuple=True)[1].view(B, -1)
-        new_indices = (~prv_cache_position).nonzero(as_tuple=True)[1].view(B, -1)
+    def _compute_transfer_order_for_moving(self, moving_cache_pos, moving_prv_pos):
+        """
+        Computes reordering indices for the MOVING portion only.
+        
+        The indices returned are LOCAL to the moving window (0, 1, 2, ... moving_len-1).
+        """
+        B = moving_cache_pos.shape[0]
+        device = moving_cache_pos.device
+        
+        # Current state: new tokens first, then previously cached tokens
+        prev_indices = moving_prv_pos.nonzero(as_tuple=True)[1].view(B, -1)
+        new_indices = (~moving_prv_pos).nonzero(as_tuple=True)[1].view(B, -1)
         current_order = torch.cat([new_indices, prev_indices], dim=-1)
 
-        keep_indices = cache_position.nonzero(as_tuple=True)[1].view(B, -1)
-        drop_indices = (~cache_position).nonzero(as_tuple=True)[1].view(B, -1)
+        # Next state: tokens to drop first, then tokens to keep
+        keep_indices = moving_cache_pos.nonzero(as_tuple=True)[1].view(B, -1)
+        drop_indices = (~moving_cache_pos).nonzero(as_tuple=True)[1].view(B, -1)
         next_order = torch.cat([drop_indices, keep_indices], dim=-1)
 
-        max_val = int(max(current_order.max(), next_order.max()).item()) + 1
+        # Build lookup table
+        max_val = moving_cache_pos.shape[1]  # Moving window length
         lookup_table = torch.full((B, max_val), -1, dtype=torch.long, device=device)
         src_indices = torch.arange(current_order.shape[1], device=device).expand(B, -1)
         lookup_table.scatter_(1, current_order, src_indices)
-        transfer_order = torch.gather(lookup_table, 1, next_order)
 
-        self._transfer_order = transfer_order
+        # Get transfer order
+        transfer_order = torch.gather(lookup_table, 1, next_order)
         return transfer_order
     
     def get_confirmed_len_local(self, cache_position_local):
