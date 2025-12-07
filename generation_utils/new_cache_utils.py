@@ -335,6 +335,24 @@ class HierarchicalDynamicCache(Cache):
 
         # 2. Hierarchical Reordering Phase
         else:
+            input_unmasked_count = (~prv_cache_position).sum(dim=1)[0].item()
+            # NOTE: input is given as [input_unmasked_count | input_stable_count | input_moving_count]
+            # even though logically it should be [input_stable_count | input_moving_count | input_unmasked_count]
+            # and we need [input_stable_count | input_unmasked_count | input_moving_count]
+            # TODO: consider more efficient way to do this without concatenation
+            # could change convention to be [input_stable_count | input_moving_count | input_unmasked_count]
+            # in the actual attention mechanism, but would need to make sure RoPE obeys this order
+            key_states = torch.cat([
+                key_states[:, :, input_unmasked_count:input_unmasked_count + confirmed_len, :],
+                key_states[:, :, :input_unmasked_count, :],
+                key_states[:, :, confirmed_len + input_unmasked_count:, :]
+            ], dim=2)
+            value_states = torch.cat([
+                value_states[:, :, input_unmasked_count:input_unmasked_count + confirmed_len, :],
+                value_states[:, :, :input_unmasked_count, :],
+                value_states[:, :, confirmed_len + input_unmasked_count:, :]
+            ], dim=2)
+
             # Split into stable and moving portions based on confirmed_len
             stable_keys = key_states[:, :, :confirmed_len, :]
             stable_values = value_states[:, :, :confirmed_len, :]
