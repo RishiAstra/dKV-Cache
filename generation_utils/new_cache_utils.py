@@ -15,6 +15,7 @@ class VectorizedDynamicCache(Cache):
         self.value_cache: List[torch.Tensor] = []
         self.num_hidden_layers = num_hidden_layers
         self._transfer_order = None
+        self._cache_start_pos = None
 
     def get_transfer_cache(self, layer_idx, cache_position, prv_cache_position):
         # Calculate order once per step (at layer 0) and reuse
@@ -102,13 +103,23 @@ class VectorizedDynamicCache(Cache):
             key_states = torch.gather(key_states, 2, transfer_order[:, None, :, None].expand_as(key_states))
             value_states = torch.gather(value_states, 2, transfer_order[:, None, :, None].expand_as(value_states))
 
-            cache_start_pos = torch.sum(~cache_position, dim=-1)
-            if not (cache_start_pos == cache_start_pos[0]).all():
-                raise ValueError(
-                    f"Heterogeneous batches not supported. "
-                    f"All sequences must cache the same number of tokens. "
-                    f"Got cache_start_pos={cache_start_pos.tolist()}"
-                )
+            # cache_start_pos = torch.sum(~cache_position, dim=-1)
+            if layer_idx > 0:
+                temp = self._cache_start_pos
+                assert temp is not None, "cache_start_pos should have been computed at layer 0"
+                cache_start_pos = temp
+                if layer_idx == self.num_hidden_layers - 1:
+                    self._cache_start_pos = None
+            else:
+                cache_start_pos = torch.sum(~cache_position, dim=-1)
+                self._cache_start_pos = cache_start_pos
+
+            # if not (cache_start_pos == cache_start_pos[0]).all():
+            #     raise ValueError(
+            #         f"Heterogeneous batches not supported. "
+            #         f"All sequences must cache the same number of tokens. "
+            #         f"Got cache_start_pos={cache_start_pos.tolist()}"
+            #     )
             
             # Store - FIX: Ensure we're updating existing cache entries
             if len(self.key_cache) <= layer_idx:
@@ -120,7 +131,7 @@ class VectorizedDynamicCache(Cache):
                 self.key_cache[layer_idx] = key_states[:, :, cache_start_pos[0]:, :]
                 self.value_cache[layer_idx] = value_states[:, :, cache_start_pos[0]:, :]
 
-        return self.key_cache[layer_idx], self.value_cache[layer_idx]
+        # return self.key_cache[layer_idx], self.value_cache[layer_idx]
 
     def refresh_cache(self):
         self.key_cache = []
@@ -168,6 +179,9 @@ class HierarchicalDynamicCache(Cache):
         super().__init__()
         self.num_hidden_layers = num_hidden_layers
         self._transfer_order = None
+        self._confirmed_len = None
+        self._input_unmasked_count = None
+        self._cache_start_in_moving = None
         
         # Main storage for confirmed tokens (List of Tensors per layer)
         self.stable_key_cache: List[torch.Tensor] = []
@@ -188,7 +202,9 @@ class HierarchicalDynamicCache(Cache):
                 self._transfer_order = None
             return order
         
-        return self._compute_transfer_order_for_moving(cache_position, prv_cache_position)
+        # cache layer 0
+        self._transfer_order = self._compute_transfer_order_for_moving(cache_position, prv_cache_position)
+        return self._transfer_order
 
     def _compute_transfer_order_for_moving(self, moving_cache_pos, moving_prv_pos):
         """
@@ -231,17 +247,29 @@ class HierarchicalDynamicCache(Cache):
             # All True - entire sequence is stable
             return cache_position_local.shape[0]
         
-    def get_confirmed_len(self, cache_position):
+    def get_confirmed_len(self, cache_position, layer_idx):
         """Vectorized confirmed length calculation for batch"""
         if cache_position is None:
             return 0
+
+        # cache so that we only compute this once for all layers
+        if layer_idx > 0:
+            temp = self._confirmed_len
+            assert temp is not None, "Confirmed length should have been computed at layer 0"
+            if layer_idx == self.num_hidden_layers - 1:
+                self._confirmed_len = None
+            return temp
+
         # Find first False in each batch element
         B = cache_position.shape[0]
         confirmed_lens = []
         for b in range(B):
             confirmed_lens.append(self.get_confirmed_len_local(cache_position[b]))
 
-        return min(confirmed_lens)
+        # return min(confirmed_lens)
+        self._confirmed_len = min(confirmed_lens)
+        return self._confirmed_len
+
 
     def update(
         self,
@@ -259,9 +287,10 @@ class HierarchicalDynamicCache(Cache):
         # 'confirmed_len' tells us where the stable prefix ends.
         # confirmed_len = cache_kwargs.get("confirmed_len", 0)
         # confirmed_len = self.get_confirmed_len(cache_position) # NOTE: repeated work, could be once per model instead of per layer
-        confirmed_len_current = self.get_confirmed_len(cache_position)
-        confirmed_len_previous = self.get_confirmed_len(prv_cache_position)
-        confirmed_len = min(confirmed_len_current, confirmed_len_previous)
+        # confirmed_len_current = self.get_confirmed_len(cache_position)
+        # confirmed_len_previous = self.get_confirmed_len(prv_cache_position)
+        # confirmed_len = min(confirmed_len_current, confirmed_len_previous)
+        confirmed_len = self.get_confirmed_len(prv_cache_position, layer_idx)
 
         # print(f"Layer {layer_idx} - confirmed_len: {confirmed_len}")
         
@@ -270,6 +299,7 @@ class HierarchicalDynamicCache(Cache):
             raise ValueError(f"confirmed_len must be in [0, {seq_len}], got {confirmed_len}")
 
         # 1. Initialization Phase (First Step)
+        # TODO: optimize, will not have any stable, rare case anyway though
         if prv_cache_position is None:
             # Initial fill - store everything as stable for now
             assert len(self.stable_key_cache) <= layer_idx, "Cache should be empty during initialization"
@@ -335,37 +365,57 @@ class HierarchicalDynamicCache(Cache):
 
         # 2. Hierarchical Reordering Phase
         else:
-            input_unmasked_count = (~prv_cache_position).sum(dim=1)[0].item()
+            # input_unmasked_count = (~prv_cache_position).sum(dim=1)[0].item()
+            if layer_idx > 0:
+                if self._input_unmasked_count is None:
+                    raise ValueError("input_unmasked_count should have been set at layer 0")
+                input_unmasked_count = self._input_unmasked_count
+                if layer_idx == self.num_hidden_layers - 1:
+                    self._input_unmasked_count = None
+            else:
+                input_unmasked_count = (~prv_cache_position).sum(dim=1)[0].item()
+                self._input_unmasked_count = input_unmasked_count
+
             # NOTE: input is given as [input_unmasked_count | input_stable_count | input_moving_count]
             # even though logically it should be [input_stable_count | input_moving_count | input_unmasked_count]
             # and we need [input_stable_count | input_unmasked_count | input_moving_count]
             # TODO: consider more efficient way to do this without concatenation
             # could change convention to be [input_stable_count | input_moving_count | input_unmasked_count]
             # in the actual attention mechanism, but would need to make sure RoPE obeys this order
-            key_states = torch.cat([
-                key_states[:, :, input_unmasked_count:input_unmasked_count + confirmed_len, :],
-                key_states[:, :, :input_unmasked_count, :],
-                key_states[:, :, confirmed_len + input_unmasked_count:, :]
-            ], dim=2)
-            value_states = torch.cat([
-                value_states[:, :, input_unmasked_count:input_unmasked_count + confirmed_len, :],
-                value_states[:, :, :input_unmasked_count, :],
-                value_states[:, :, confirmed_len + input_unmasked_count:, :]
-            ], dim=2)
+            # key_states = torch.cat([
+            #     key_states[:, :, input_unmasked_count:input_unmasked_count + confirmed_len, :],
+            #     key_states[:, :, :input_unmasked_count, :],
+            #     key_states[:, :, confirmed_len + input_unmasked_count:, :]
+            # ], dim=2)
+            # value_states = torch.cat([
+            #     value_states[:, :, input_unmasked_count:input_unmasked_count + confirmed_len, :],
+            #     value_states[:, :, :input_unmasked_count, :],
+            #     value_states[:, :, confirmed_len + input_unmasked_count:, :]
+            # ], dim=2)
 
-            # Split into stable and moving portions based on confirmed_len
-            stable_keys = key_states[:, :, :confirmed_len, :]
-            stable_values = value_states[:, :, :confirmed_len, :]
-            
-            moving_keys = key_states[:, :, confirmed_len:, :]
-            moving_values = value_states[:, :, confirmed_len:, :]
+            # # Split into stable and moving portions based on confirmed_len
+            # stable_keys = key_states[:, :, :confirmed_len, :]
+            # stable_values = value_states[:, :, :confirmed_len, :]
+            stable_keys = key_states[:, :, input_unmasked_count:input_unmasked_count + confirmed_len, :]
+            stable_values = value_states[:, :, input_unmasked_count:input_unmasked_count + confirmed_len, :]
+
+            # moving_keys = key_states[:, :, confirmed_len:, :]
+            # moving_values = value_states[:, :, confirmed_len:, :]
+            moving_keys = torch.cat([
+                key_states[:, :, :input_unmasked_count, :],
+                key_states[:, :, input_unmasked_count + confirmed_len:, :]
+            ], dim=2)
+            moving_values = torch.cat([
+                value_states[:, :, :input_unmasked_count, :],
+                value_states[:, :, input_unmasked_count + confirmed_len:, :]
+            ], dim=2)
             
             # Calculate transfer order only for moving window
             moving_cache_pos = cache_position[:, confirmed_len:]
             moving_prv_pos = prv_cache_position[:, confirmed_len:]
             # don't need for stable portion because it's a prefix of fully cached tokens
             # can verify:
-            assert (cache_position[:, :confirmed_len] == True).all(), f"Stable portion of cache_position should be all True but got {cache_position[:, :confirmed_len]}"
+            # assert (cache_position[:, :confirmed_len] == True).all(), f"Stable portion of cache_position should be all True but got {cache_position[:, :confirmed_len]}"
             
             if moving_cache_pos.numel() > 0 and moving_prv_pos.numel() > 0:
                 local_transfer_order = self.get_transfer_cache(
@@ -386,15 +436,24 @@ class HierarchicalDynamicCache(Cache):
                 moving_values_reordered = moving_values
 
             # Extract only the cached portion of moving window
-            cache_start_in_moving = torch.sum(~moving_cache_pos, dim=-1)
+            # cache_start_in_moving = torch.sum(~moving_cache_pos, dim=-1)
+            if layer_idx > 0:
+                temp = self._cache_start_in_moving
+                assert temp is not None, "cache_start_in_moving should have been computed at layer 0"
+                cache_start_in_moving = temp
+                if layer_idx == self.num_hidden_layers - 1:
+                    self._cache_start_in_moving = None
+            else:
+                cache_start_in_moving = torch.sum(~moving_cache_pos, dim=-1)
+                self._cache_start_in_moving = cache_start_in_moving
             
-            # Validate homogeneous batching
-            if not (cache_start_in_moving == cache_start_in_moving[0]).all():
-                raise ValueError(
-                    f"Heterogeneous batches not supported. "
-                    f"All sequences must cache the same number of tokens in moving window. "
-                    f"Got cache_start_in_moving={cache_start_in_moving.tolist()}"
-                )
+            # # Validate homogeneous batching
+            # if not (cache_start_in_moving == cache_start_in_moving[0]).all():
+            #     raise ValueError(
+            #         f"Heterogeneous batches not supported. "
+            #         f"All sequences must cache the same number of tokens in moving window. "
+            #         f"Got cache_start_in_moving={cache_start_in_moving.tolist()}"
+            #     )
             
             # Update storage
             new_moving_keys = moving_keys_reordered[:, :, cache_start_in_moving[0]:, :]
@@ -412,21 +471,21 @@ class HierarchicalDynamicCache(Cache):
                 self.moving_key_cache[layer_idx] = new_moving_keys
                 self.moving_value_cache[layer_idx] = new_moving_values
 
-            # Return combined cache
-            if self.moving_key_cache[layer_idx].numel() > 0:
-                final_keys = torch.cat(
-                    [self.stable_key_cache[layer_idx], self.moving_key_cache[layer_idx]], 
-                    dim=2
-                )
-                final_values = torch.cat(
-                    [self.stable_value_cache[layer_idx], self.moving_value_cache[layer_idx]], 
-                    dim=2
-                )
-            else:
-                final_keys = self.stable_key_cache[layer_idx]
-                final_values = self.stable_value_cache[layer_idx]
+            # # Return combined cache
+            # if self.moving_key_cache[layer_idx].numel() > 0:
+            #     final_keys = torch.cat(
+            #         [self.stable_key_cache[layer_idx], self.moving_key_cache[layer_idx]], 
+            #         dim=2
+            #     )
+            #     final_values = torch.cat(
+            #         [self.stable_value_cache[layer_idx], self.moving_value_cache[layer_idx]], 
+            #         dim=2
+            #     )
+            # else:
+            #     final_keys = self.stable_key_cache[layer_idx]
+            #     final_values = self.stable_value_cache[layer_idx]
             
-            return final_keys, final_values
+            # return final_keys, final_values
 
     def refresh_cache(self):
         self.stable_key_cache = []
@@ -446,14 +505,16 @@ class HierarchicalDynamicCache(Cache):
         if layer_idx < len(self.stable_key_cache):
             # Check if moving cache exists and has content
             if layer_idx < len(self.moving_key_cache) and self.moving_key_cache[layer_idx].numel() > 0:
-                final_keys = torch.cat(
-                    [self.stable_key_cache[layer_idx], self.moving_key_cache[layer_idx]], 
-                    dim=2
-                )
-                final_values = torch.cat(
-                    [self.stable_value_cache[layer_idx], self.moving_value_cache[layer_idx]], 
-                    dim=2
-                )
+                # final_keys = torch.cat(
+                #     [self.stable_key_cache[layer_idx], self.moving_key_cache[layer_idx]], 
+                #     dim=2
+                # )
+                # final_values = torch.cat(
+                #     [self.stable_value_cache[layer_idx], self.moving_value_cache[layer_idx]], 
+                #     dim=2
+                # )
+                final_keys = (self.stable_key_cache[layer_idx], self.moving_key_cache[layer_idx])
+                final_values = (self.stable_value_cache[layer_idx], self.moving_value_cache[layer_idx])
             else:
                 # No moving cache or it's empty, just return stable
                 final_keys = self.stable_key_cache[layer_idx]

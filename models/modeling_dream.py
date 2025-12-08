@@ -413,8 +413,24 @@ class DreamSdpaAttention(DreamAttention):
 
         if use_cache and not past_key_value.is_empty():
             #print("In Cache:",  key_states.shape, past_key_value[self.layer_idx][0].shape, prv_cache_position.nonzero(as_tuple=True)[1].view(bsz, -1))
-            key_states = torch.cat([key_states, past_key_value[self.layer_idx][0]], dim=2)
-            value_states = torch.cat([value_states, past_key_value[self.layer_idx][1]], dim=2)
+            # key_states = torch.cat([key_states, past_key_value[self.layer_idx][0]], dim=2)
+            # value_states = torch.cat([value_states, past_key_value[self.layer_idx][1]], dim=2)
+
+            cached_k, cached_v = past_key_value[self.layer_idx]
+
+            # Check if it's hierarchical (tuple of tensors) or flat (single tensor)
+            # this avoids having an extra torch.cat inside the cache
+            if isinstance(cached_k, tuple):
+                # Hierarchical: (stable, moving)
+                key_states = torch.cat([key_states, cached_k[0], cached_k[1]], dim=2)
+                value_states = torch.cat([value_states, cached_v[0], cached_v[1]], dim=2)
+            else:
+                # Standard: single tensor
+                key_states = torch.cat([key_states, cached_k], dim=2)
+                value_states = torch.cat([value_states, cached_v], dim=2)
+
+
+
             k_len = key_states.shape[1]
 
             #print((~prv_cache_position).sum(dim=-1))
@@ -428,7 +444,8 @@ class DreamSdpaAttention(DreamAttention):
                 "cache_position": cache_position,
                 "prv_cache_position": prv_cache_position,
             }  # Specific to RoPE models
-            past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+            with nvtx.annotate("cache_update", color="red"):
+                past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
         if position_embeddings is None:
             raise ValueError(

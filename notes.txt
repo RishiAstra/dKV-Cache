@@ -1,3 +1,5 @@
+/mnt/d/dKV-Cache$ nsys profile --trace=cuda,nvtx,osrt --output=nsight/nsys_dream_s128_cs8__hier_op /home/raa32/miniconda3/envs/dkvcache/bin/python dream_generate.py --new-hier --cache-steps 8 --steps 128 --seq-len 128
+
 /home/raa32/miniconda3/envs/dkvcache/bin/python -m cProfile -o profile_dream_new2.out   dream_generate.py --new-cache --cache-steps 4 --steps 128 --seq-len 128
 
 

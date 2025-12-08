@@ -93,6 +93,7 @@ if __name__ == "__main__":
     attention_mask = prompt_ids.attention_mask.to(device="cuda")
     
     # timer start
+    torch.cuda.synchronize() # force finishing model loading scheduled GPU work
     start_time = time.perf_counter()
     output = model.diffusion_generate(
         input_ids,
