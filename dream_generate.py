@@ -91,7 +91,9 @@ if __name__ == "__main__":
     prompt_ids = tokenizer(prompts, return_tensors="pt", padding=True, padding_side="left")
     input_ids = prompt_ids.input_ids.to(device="cuda")
     attention_mask = prompt_ids.attention_mask.to(device="cuda")
-   
+    
+    # timer start
+    start_time = time.perf_counter()
     output = model.diffusion_generate(
         input_ids,
         attention_mask=attention_mask,
@@ -108,11 +110,13 @@ if __name__ == "__main__":
         cache_steps=args.cache_steps,
         shift_type="un"
     )
+    torch.cuda.synchronize() # force finishing scheduled GPU work
+    end_time = time.perf_counter()
     
     for b in range(len(messages)):
         print()
         print(f"----Question {b+1}: {messages[b][0]['content']}")
         sequence = output.sequences[b]
         print(tokenizer.decode(sequence[len(input_ids[0]):]).split('<|endoftext|>')[0])
-    
-        
+
+    print(f"Generation took {end_time - start_time:.2f} seconds")
